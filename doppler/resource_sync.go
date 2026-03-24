@@ -63,13 +63,58 @@ func (builder ResourceSyncBuilder) Build() *schema.Resource {
 		Importer: &schema.ResourceImporter{
 			StateContext: func(ctx context.Context, d *schema.ResourceData, m interface{}) ([]*schema.ResourceData, error) {
 				// Import ID format: project.config.sync_slug
-				parts := strings.SplitN(d.Id(), ".", 3)
-				if len(parts) != 3 {
-					return nil, fmt.Errorf("invalid import ID %q, expected format: project.config.sync_slug", d.Id())
+				// For syncs that need extra data not returned by the API, additional
+				// fields can be appended: project.config.sync_slug.key=value.key=value
+				// Example: my-project.prd.abc123.project_id=prj_xxx.team_id=team_xxx
+				mainParts := strings.SplitN(d.Id(), ".", 3)
+				if len(mainParts) < 3 {
+					return nil, fmt.Errorf("invalid import ID %q, expected format: project.config.sync_slug[.key=value...]", d.Id())
 				}
-				d.Set("project", parts[0])
-				d.Set("config", parts[1])
-				d.SetId(parts[2])
+				project := mainParts[0]
+				config := mainParts[1]
+
+				// Split the rest to separate sync_slug from optional key=value pairs
+				rest := mainParts[2]
+				restParts := strings.Split(rest, ".")
+				syncSlug := restParts[0]
+
+				d.Set("project", project)
+				d.Set("config", config)
+				d.SetId(syncSlug)
+
+				// Parse optional key=value pairs
+				for _, kv := range restParts[1:] {
+					eqIdx := strings.Index(kv, "=")
+					if eqIdx > 0 {
+						key := kv[:eqIdx]
+						value := kv[eqIdx+1:]
+						if _, ok := resourceSchema[key]; ok {
+							d.Set(key, value)
+						}
+					}
+				}
+
+				// The GET sync API does not return data fields (project_id, target_id, etc.),
+				// so we fetch from the integrations endpoint which includes the description
+				// field containing target and variable_type information.
+				client := m.(APIClient)
+				sync, err := client.GetSyncFromIntegrations(ctx, project, config, syncSlug)
+				if err != nil {
+					return nil, fmt.Errorf("failed to fetch sync from integrations API: %w", err)
+				}
+				if sync == nil {
+					return nil, fmt.Errorf("sync %q not found in project %q config %q", syncSlug, project, config)
+				}
+
+				if sync.Integration != "" {
+					d.Set("integration", sync.Integration)
+				}
+
+				// Populate data fields from the sync
+				if builder.DataReader != nil && sync.Data != nil {
+					builder.DataReader(sync.Data, d)
+				}
+
 				return []*schema.ResourceData{d}, nil
 			},
 		},
@@ -126,6 +171,9 @@ func (builder ResourceSyncBuilder) ReadContextFunc() schema.ReadContextFunc {
 			return diag.FromErr(err)
 		}
 
+		// Only update data fields if the API returns them.
+		// The GET sync API returns data: null, so we preserve existing state values
+		// to avoid erasing data set during import or create.
 		if builder.DataReader != nil && sync.Data != nil {
 			if err = builder.DataReader(sync.Data, d); err != nil {
 				return diag.FromErr(err)

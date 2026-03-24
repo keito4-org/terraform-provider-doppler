@@ -599,6 +599,91 @@ func (client APIClient) CreateSync(ctx context.Context, data SyncData, config, p
 	return &result.Sync, nil
 }
 
+// GetSyncFromIntegrations fetches sync data via the integrations endpoint.
+// The GET sync endpoint returns data: null, so this uses the integrations
+// list which includes a description field that can be parsed for metadata.
+func (client APIClient) GetSyncFromIntegrations(ctx context.Context, project, config, syncSlug string) (*Sync, error) {
+	response, err := client.PerformRequestWithRetry(ctx, "GET", "/v3/integrations", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Integrations []struct {
+			Slug  string `json:"slug"`
+			Type  string `json:"type"`
+			Syncs []struct {
+				Slug        string                 `json:"slug"`
+				Project     string                 `json:"project"`
+				Config      string                 `json:"config"`
+				Description string                 `json:"description"`
+				Data        map[string]interface{} `json:"data"`
+			} `json:"syncs"`
+		} `json:"integrations"`
+	}
+	if err = json.Unmarshal(response.Body, &result); err != nil {
+		return nil, &APIError{Err: err, Message: "Unable to parse integrations"}
+	}
+	for _, integ := range result.Integrations {
+		for _, s := range integ.Syncs {
+			if s.Slug == syncSlug && s.Project == project && s.Config == config {
+				data := s.Data
+				// The API does not return a data field for syncs.
+				// For Vercel syncs, parse the description field to extract metadata.
+				// Description format: "project-name / Target / VariableType"
+				if data == nil && integ.Type == "vercel" && s.Description != "" {
+					data = parseVercelSyncDescription(s.Description)
+				}
+				return &Sync{
+					Slug:        s.Slug,
+					Project:     s.Project,
+					Config:      s.Config,
+					Integration: integ.Slug,
+					Data:        data,
+				}, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+// parseVercelSyncDescription extracts target_id and variable_type from
+// a Vercel sync description string like "project-name / Production / Encrypted".
+func parseVercelSyncDescription(desc string) map[string]interface{} {
+	parts := strings.Split(desc, " / ")
+	if len(parts) < 3 {
+		return nil
+	}
+	data := map[string]interface{}{}
+
+	// Map target name to Vercel environment target ID
+	target := strings.TrimSpace(parts[1])
+	targetMap := map[string]string{
+		"Production":  "production",
+		"Preview":     "preview",
+		"Development": "development",
+		"Staging":     "staging",
+	}
+	if targetID, ok := targetMap[target]; ok {
+		data["target_id"] = targetID
+	} else {
+		// Custom environment: use as-is (could be a custom environment ID)
+		data["target_id"] = strings.ToLower(target)
+	}
+
+	// Map variable type name to API value
+	varType := strings.TrimSpace(parts[2])
+	varTypeMap := map[string]string{
+		"Encrypted": "encrypted",
+		"Sensitive": "sensitive",
+		"Plain":     "plain",
+	}
+	if vt, ok := varTypeMap[varType]; ok {
+		data["variable_type"] = vt
+	}
+
+	return data
+}
+
 func (client APIClient) DeleteSync(ctx context.Context, slug string, deleteTarget bool, config, project string) error {
 	params := []QueryParam{
 		{Key: "config", Value: config},
