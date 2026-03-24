@@ -618,9 +618,12 @@ func resourceSyncVercel() *schema.Resource {
 			if teamID, ok := d.GetOk("team_id"); ok {
 				payload["team_id"] = teamID
 			}
-			if variableType, ok := d.GetOk("variable_type"); ok {
-				payload["variable_type"] = variableType
+			// variable_type is required by the API; default to "encrypted" if not set
+			variableType := d.Get("variable_type").(string)
+			if variableType == "" {
+				variableType = "encrypted"
 			}
+			payload["variable_type"] = variableType
 			return payload
 		},
 		DataReader: func(data map[string]interface{}, d *schema.ResourceData) error {
